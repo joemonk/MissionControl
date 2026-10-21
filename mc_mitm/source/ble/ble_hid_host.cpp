@@ -23,6 +23,7 @@
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "../controllers/controller_management.hpp"
 #include "../controllers/xbox_one_ble_controller.hpp"
+#include "../controllers/stadia_ble_controller.hpp"
 
 namespace ams::ble {
 
@@ -54,7 +55,10 @@ namespace ams::ble {
 
         /* The controller currently presented to the system */
         constinit os::SdkMutex g_controller_lock;
-        std::shared_ptr<controller::XboxOneBleController> g_controller;
+        std::shared_ptr<controller::SwitchController> g_controller;
+
+        /* Track which controller type is connected (determined at scan time) */
+        constinit bool g_controller_is_stadia = false;
 
         /* Advertisement parsing */
 
@@ -97,6 +101,14 @@ namespace ams::ble {
             return (std::strncmp(summary.name, "Xbox", 4) == 0) || (summary.has_appearance && (summary.appearance == AppearanceGamepad));
         }
 
+        bool IsStadiaController(const AdvertisementSummary &summary) {
+            return std::strncmp(summary.name, "Stadia Controller", 17) == 0;
+        }
+
+        bool IsTargetController(const AdvertisementSummary &summary) {
+            return IsXboxController(summary) || IsStadiaController(summary);
+        }
+
         /* LE HID event stream: notifications from services registered with RegisterGattHidDataPath, and the results
            of our GATT requests on them, arrive here rather than on the managed BLE event */
 
@@ -127,13 +139,18 @@ namespace ams::ble {
                 }
 
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    std::shared_ptr<controller::XboxOneBleController> controller;
+                    std::shared_ptr<controller::SwitchController> controller;
                     {
                         std::scoped_lock lk(g_controller_lock);
                         controller = g_controller;
                     }
                     if (controller) {
-                        static_cast<void>(controller->HandleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
+                        const size_t data_size = std::min<size_t>(notify.size, sizeof(notify.data));
+                        if (g_controller_is_stadia) {
+                            static_cast<void>(static_cast<controller::StadiaBleController *>(controller.get())->HandleInputReport(notify.data, data_size));
+                        } else {
+                            static_cast<void>(static_cast<controller::XboxOneBleController *>(controller.get())->HandleInputReport(notify.data, data_size));
+                        }
                     }
                 } else {
                     events::NoteGattResult(notify.result);
@@ -252,7 +269,7 @@ namespace ams::ble {
                 }
                 AdvertisementSummary summary;
                 ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
-                return IsXboxController(summary);
+                return IsTargetController(summary);
             });
 
             static_cast<void>(btdrvStopBleScan());
@@ -266,6 +283,12 @@ namespace ams::ble {
             R_UNLESS(found, svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
+            {
+                AdvertisementSummary found_summary;
+                ParseAdvertisements(e.info.scan_result.ad_list, e.info.scan_result.count, &found_summary);
+                g_controller_is_stadia = IsStadiaController(found_summary);
+                log::Write("found %s controller", g_controller_is_stadia ? "Stadia" : "Xbox");
+            }
             events::LogAddress("found controller", *out_address);
 
             if (log::IsEnabled()) {
@@ -368,24 +391,39 @@ namespace ams::ble {
                 log::Write("no output Report characteristic, rumble unavailable");
             }
 
-            auto controller = std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
-            {
-                std::scoped_lock lk(g_controller_lock);
-                g_controller = controller;
-            }
-            controller::AttachVirtualController(controller);
-            g_pairing_failed_tick = 0;
+            if (g_controller_is_stadia) {
+                auto controller = std::make_shared<controller::StadiaBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+                {
+                    std::scoped_lock lk(g_controller_lock);
+                    g_controller = controller;
+                }
+                controller::AttachVirtualController(controller);
+                g_pairing_failed_tick = 0;
 
-            // hid registers a controller on the first input report, and the pad only reports when something is
-            // touched, so its resting state is delivered once here (sticks centred, nothing pressed)
-            u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-            static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
+                // Neutral report: dpad centred (0x08), no buttons, sticks at 0x80, triggers 0
+                // (9 bytes payload, id 0x03 prepended by StadiaBleController::HandleInputReport)
+                u8 neutral[9] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00 };
+                static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
+            } else {
+                auto controller = std::make_shared<controller::XboxOneBleController>(address, conn_id, hid.service.id, hid.service.is_primary, hid.output_report.id);
+                {
+                    std::scoped_lock lk(g_controller_lock);
+                    g_controller = controller;
+                }
+                controller::AttachVirtualController(controller);
+                g_pairing_failed_tick = 0;
+
+                // hid registers a controller on the first input report, and the pad only reports when something is
+                // touched, so its resting state is delivered once here (sticks centred, nothing pressed)
+                u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+                static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
+            }
 
             log::Write("controller presented to the system");
         }
 
         void Dismiss(const bluetooth::Address &address) {
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::SwitchController> controller;
             {
                 std::scoped_lock lk(g_controller_lock);
                 controller = std::move(g_controller);
